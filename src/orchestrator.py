@@ -171,7 +171,11 @@ def resolve_selected_report(selected: str, candidates) -> str:
 
 
 
-def build_orchestrator_system_prompt(mute_findings: bool = False, mute_anatomy: bool = False):
+def build_orchestrator_system_prompt(
+    mute_findings: bool = False,
+    mute_anatomy: bool = False,
+    blind_revision: bool = False,
+):
     """Static system message — sent once, stays fixed across all turns."""
     findings_block = "" if mute_findings else (
         "run_findings_judge\n"
@@ -183,19 +187,23 @@ def build_orchestrator_system_prompt(mute_findings: bool = False, mute_anatomy: 
         "  Checks section placement and duplicate findings.\n"
         "  Produces anatomy feedback for the current report version.\n\n"
     )
-    if mute_findings and mute_anatomy:
+    if mute_findings and mute_anatomy and blind_revision:
         heuristic = (
-            "No judges are active in this ablation run. "
-            "Structure the report carefully and finalize promptly."
+            "Use revise_report to improve the current report against the source text. "
+            "When you are satisfied with the report quality, finalize it."
+        )
+    elif mute_findings and mute_anatomy:
+        heuristic = (
+            "Structure the report carefully against the source text and finalize when satisfied."
         )
     elif mute_findings:
         heuristic = (
-            "Only the anatomy judge is active (findings judge is disabled for this ablation run).\n"
+            "Use the anatomy judge to verify section placement and duplicates.\n"
             "When the anatomy judge returns completely empty feedback, finalize."
         )
     elif mute_anatomy:
         heuristic = (
-            "Only the findings judge is active (anatomy judge is disabled for this ablation run).\n"
+            "Use the findings judge to verify clinical completeness.\n"
             "When the findings judge returns completely empty feedback, finalize."
         )
     else:
@@ -211,6 +219,18 @@ def build_orchestrator_system_prompt(mute_findings: bool = False, mute_anatomy: 
         *( ["run_anatomy_judge"]  if not mute_anatomy  else [] ),
         "revise_report", "select_best_candidate", "finalize_report",
     ]
+    if blind_revision:
+        revise_description = (
+            "  Improves the current report against the source text. "
+            "Use it when the current structured report has discrepancies with the source free-text, "
+            "or when any findings appear to be placed under the wrong anatomical section. "
+            "Consumes one revision round."
+        )
+    else:
+        revise_description = (
+            "  Uses current judge feedback to produce an improved report version.\n"
+            "  Requires non-empty feedback. Consumes one revision round."
+        )
     return f"""You are an autonomous radiology report quality controller.
 You have verification tools available. Use your judgement to decide which action produces the best final report.
 At each turn you will receive the current state. Choose exactly one action and return only JSON.
@@ -220,8 +240,7 @@ At each turn you will receive the current state. Choose exactly one action and r
 
 === AVAILABLE ACTIONS ===
 {findings_block}{anatomy_block}revise_report
-  Uses current judge feedback to produce an improved report version.
-  Requires non-empty feedback. Consumes one revision round.
+{revise_description}
 
 select_best_candidate
   Picks the best report from all candidates generated so far.
@@ -372,7 +391,7 @@ def _sep(title=""):
 
 def _print_report(report: str):
     print(report)
-    print("" * _W)
+    print("─" * _W)
 
 def _print_decision(tool_call, max_tool_calls, requested, final, certainty, reason, used_fallback):
     icon = "⚠" if used_fallback else "▶"
@@ -437,11 +456,13 @@ def _print_summary(metadata, tool_calls_used, max_tool_calls, revision_rounds_us
 def run_orchestrator_agent_pipeline(
     free_text, max_tool_calls, max_revision_rounds, select_final,
     mute_findings_judge: bool = False, mute_anatomy_judge: bool = False,
+    blind_revision: bool = False,
 ):
     prompt_log = []  # full record of every prompt + response for every agent
 
     ablation_label = (
-        "no_findings_no_anatomy" if (mute_findings_judge and mute_anatomy_judge)
+        "no_findings_no_anatomy_blind_revision" if (mute_findings_judge and mute_anatomy_judge and blind_revision)
+        else "no_findings_no_anatomy" if (mute_findings_judge and mute_anatomy_judge)
         else "no_findings" if mute_findings_judge
         else "no_anatomy"  if mute_anatomy_judge
         else "all_judges"
@@ -483,6 +504,7 @@ def run_orchestrator_agent_pipeline(
     # Initialize orchestrator conversation with a fixed system message.
     messages = [{"role": "system", "content": build_orchestrator_system_prompt(
         mute_findings=mute_findings_judge, mute_anatomy=mute_anatomy_judge,
+        blind_revision=blind_revision,
     )}]
 
     for tool_call in range(1, max_tool_calls + 1):
@@ -538,11 +560,11 @@ def run_orchestrator_agent_pipeline(
 
         # Ablation guards — redirect muted-judge actions as a safety net
         if action == "run_findings_judge" and mute_findings_judge:
-            action = "finalize_report"
-            reason = "Findings judge is muted in this ablation run."
+            action = "revise_report" if blind_revision else "finalize_report"
+            reason = "No judge feedback available; revising against source." if blind_revision else "Findings judge is muted in this ablation run."
         elif action == "run_anatomy_judge" and mute_anatomy_judge:
-            action = "finalize_report"
-            reason = "Anatomy judge is muted in this ablation run."
+            action = "revise_report" if blind_revision else "finalize_report"
+            reason = "No judge feedback available; revising against source." if blind_revision else "Anatomy judge is muted in this ablation run."
 
         # Minimal budget guards only — no routing overrides.
         if action == "revise_report" and revision_rounds_used >= max_revision_rounds:
@@ -637,10 +659,12 @@ def run_orchestrator_agent_pipeline(
         elif action == "revise_report":
             # Apply findings and anatomy feedback in separate calls so the model
             # handles one concern at a time rather than all four feedback types at once.
-            has_findings = bool(
+            # In blind_revision mode both revisors always run with empty feedback so the
+            # model self-reviews against the source text using the same prompt as normal.
+            has_findings = blind_revision or bool(
                 findings_feedback.get("missing_findings") or findings_feedback.get("unsupported_findings")
             )
-            has_anatomy = bool(
+            has_anatomy = blind_revision or bool(
                 anatomy_feedback.get("wrong_section_findings") or anatomy_feedback.get("duplicate_findings")
             )
             intermediate = current_report
@@ -854,6 +878,7 @@ def run_with_retries(free_text, args):
                 select_final=args.select_final,
                 mute_findings_judge=getattr(args, "mute_findings_judge", False),
                 mute_anatomy_judge=getattr(args, "mute_anatomy_judge", False),
+                blind_revision=getattr(args, "blind_revision", False),
             )
             # strip any preamble the model echoed before FINDINGS before storing
             return workflow.base_agent.extract_findings_section(output), metadata, prompt_log, "", attempt
@@ -883,6 +908,8 @@ def process_csv(args):
         ablation_parts.append("no_findings")
     if getattr(args, "mute_anatomy_judge", False):
         ablation_parts.append("no_anatomy")
+    if getattr(args, "blind_revision", False):
+        ablation_parts.append("blind_revision")
     ablation_suffix = ("_ablation_" + "_".join(ablation_parts)) if ablation_parts else ""
 
     output_csv = Path(args.output_csv) if args.output_csv else Path(
@@ -1100,6 +1127,8 @@ def parse_args():
                         help="Disable the findings judge (ablation: no clinical-faithfulness feedback).")
     parser.add_argument("--mute_anatomy_judge", action="store_true", default=False,
                         help="Disable the anatomy judge (ablation: no section-placement/duplicate feedback).")
+    parser.add_argument("--blind_revision", action="store_true", default=False,
+                        help="Ablation: mute both judges and revise using self-review against source only (no judge feedback).")
     return parser.parse_args()
 
 
