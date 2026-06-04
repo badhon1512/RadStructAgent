@@ -23,9 +23,9 @@ def get_attn_impl():
                 attn = "flash_attention_2"
                 print(f"[info] Using FlashAttention-2 (GPU CC {cc[0]}.{cc[1]})")
             else:
-                print(f"[warn] FlashAttention found but GPU CC {cc[0]}.{cc[1]} < 8.0 → fallback to eager")
+                print(f"[warn] FlashAttention found but GPU CC {cc[0]}.{cc[1]} < 8.0 -> fallback to eager")
         else:
-            print("[warn] No CUDA device detected → fallback to eager")
+            print("[warn] No CUDA device detected -> fallback to eager")
     except ImportError:
         print("[warn] flash_attn not installed -> fallback to eager")
     return attn

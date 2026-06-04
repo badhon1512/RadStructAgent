@@ -427,3 +427,216 @@ ANATOMY_FEEDBACK:
 """.strip()
 
 
+def build_revision_selection_prompt(free_text: str, candidates) -> str:
+    candidates_text = json.dumps(candidates, indent=2, ensure_ascii=False)
+    return f"""
+You are an expert radiology report quality controller.
+
+Your task:
+Select the best final structured report from the candidate reports.
+
+Original structuring instructions:
+{main_prompt}
+
+Use these original instructions only to judge which candidate best follows the required structured-report format. Do not create new findings from these instructions.
+
+Selection criteria, in order:
+1. The report must be clinically faithful to the source free-text report.
+2. It must preserve all clinically meaningful source findings.
+3. It must not include unsupported or hallucinated findings.
+4. Findings should be placed under appropriate anatomical section headers.
+5. The report should be concise and not duplicate findings.
+
+Important rules:
+- Use only the source report as the clinical truth.
+- Do not add new findings while selecting.
+- Prefer a later candidate only if it improves clinical faithfulness: it preserves all supported findings from the earlier candidate while reducing missing source findings, unsupported findings, wrong-section findings, or duplicate findings.
+
+Output format:
+- Return ONLY the text of the selected structured report, exactly as it appears in the candidates.
+- Do not include any analysis, reasoning, commentary, or explanations.
+- Do not modify the selected report in any way.
+- Do not add any text outside of the clinical findings in structured format.
+
+Source free-text report:
+{free_text}
+
+Candidate structured reports:
+{candidates_text}
+""".strip()
+
+
+def build_orchestrator_system_prompt(
+    mute_findings: bool = False,
+    mute_anatomy: bool = False,
+    blind_revision: bool = False,
+):
+    findings_block = "" if mute_findings else (
+        "run_findings_judge\n"
+        "  Checks whether the report faithfully captures all source findings (no missing, no hallucinated).\n"
+        "  Produces findings feedback for the current report version.\n\n"
+    )
+    anatomy_block = "" if mute_anatomy else (
+        "run_anatomy_judge\n"
+        "  Checks section placement and duplicate findings.\n"
+        "  Produces anatomy feedback for the current report version.\n\n"
+    )
+    if mute_findings and mute_anatomy and blind_revision:
+        heuristic = (
+            "Use revise_report to improve the current report against the source text. "
+            "When you are satisfied with the report quality, finalize it."
+        )
+    elif mute_findings and mute_anatomy:
+        heuristic = (
+            "Structure the report carefully against the source text and finalize when satisfied."
+        )
+    elif mute_findings:
+        heuristic = (
+            "Use the anatomy judge to verify section placement and duplicates.\n"
+            "When the anatomy judge returns completely empty feedback, finalize."
+        )
+    elif mute_anatomy:
+        heuristic = (
+            "Use the findings judge to verify clinical completeness.\n"
+            "When the findings judge returns completely empty feedback, finalize."
+        )
+    else:
+        heuristic = (
+            "The two judges are independent — findings judge checks clinical completeness, "
+            "anatomy judge checks structural correctness.\n"
+            "When BOTH judges return completely empty feedback on the same report version, this is strong evidence that the report is\n"
+            "clinically faithful and structurally correct. That is the right moment to finalize.\n"
+            "If either judge has not yet run on the current version, or returned non-empty feedback, more work is needed."
+        )
+    active_action_names = [
+        *( ["run_findings_judge"] if not mute_findings else [] ),
+        *( ["run_anatomy_judge"]  if not mute_anatomy  else [] ),
+        "revise_report", "select_best_candidate", "finalize_report",
+    ]
+    if blind_revision:
+        revise_description = (
+            "  Improves the current report against the source text. "
+            "Use it when the current structured report has discrepancies with the source free-text, "
+            "or when any findings appear to be placed under the wrong anatomical section. "
+            "Consumes one revision round."
+        )
+    else:
+        revise_description = (
+            "  Uses current judge feedback to produce an improved report version.\n"
+            "  Requires non-empty feedback. Consumes one revision round."
+        )
+    return f"""You are an autonomous radiology report quality controller.
+You have verification tools available. Use your judgement to decide which action produces the best final report.
+At each turn you will receive the current state. Choose exactly one action and return only JSON.
+
+=== STRUCTURING GUIDELINES ===
+{main_prompt}
+
+=== AVAILABLE ACTIONS ===
+{findings_block}{anatomy_block}revise_report
+{revise_description}
+
+select_best_candidate
+  Picks the best report from all candidates generated so far.
+  Requires at least 2 candidates.
+
+finalize_report
+  Accepts the current report as the final output.
+
+=== CONFIDENCE HEURISTIC ===
+{heuristic}
+
+=== OUTPUT FORMAT ===
+{{"action": "{' | '.join(active_action_names)}", "reason": "one sentence", "certainty": "judge-verified | self-verified | uncertain"}}"""
+
+
+def build_orchestrator_user_message(
+    free_text,
+    current_report,
+    findings_feedback,
+    anatomy_feedback,
+    candidates,
+    state,
+    max_tool_calls,
+    max_revision_rounds,
+    mute_findings: bool = False,
+    mute_anatomy: bool = False,
+):
+    missing       = findings_feedback.get("missing_findings") or []
+    unsupported   = findings_feedback.get("unsupported_findings") or []
+    wrong_section = anatomy_feedback.get("wrong_section_findings") or []
+    duplicates    = anatomy_feedback.get("duplicate_findings") or []
+
+    findings_ran = state.get("findings_judge_ran_since_last_revision", False)
+    anatomy_ran  = state.get("anatomy_judge_ran_since_last_revision", False)
+
+    tool_calls_remaining      = max_tool_calls      - state["tool_call"]
+    revision_rounds_remaining = max_revision_rounds - state["revision_rounds_used"]
+    total_revisions           = state["revision_rounds_used"]
+    current_version           = "initial" if total_revisions == 0 else f"revision {total_revisions}"
+    candidate_stages          = [c["stage"] for c in candidates]
+
+    if findings_ran:
+        findings_summary = (
+            f"  missing_findings ({len(missing)}): {missing}\n"
+            f"  unsupported_findings ({len(unsupported)}): {unsupported}"
+        )
+    else:
+        findings_summary = "  NOT YET RUN on the current report version."
+
+    if anatomy_ran:
+        anatomy_summary = (
+            f"  wrong_section_findings ({len(wrong_section)}): {[f['finding'][:80] for f in wrong_section]}\n"
+            f"  duplicate_findings ({len(duplicates)}): {[f['finding'][:80] for f in duplicates]}"
+        )
+    else:
+        anatomy_summary = "  NOT YET RUN on the current report version."
+
+    findings_clean = findings_ran and not missing and not unsupported
+    anatomy_clean  = anatomy_ran  and not wrong_section and not duplicates
+    active_judges_clean = (
+        (mute_findings or findings_clean) and (mute_anatomy or anatomy_clean)
+    )
+
+    judge_status_lines = ""
+    if not mute_findings:
+        judge_status_lines += f"Findings judge ran on THIS version: {findings_ran}\n"
+    if not mute_anatomy:
+        judge_status_lines += f"Anatomy judge ran on THIS version:  {anatomy_ran}\n"
+    judge_status_lines += f"Active judges clean on THIS version: {active_judges_clean}"
+
+    findings_calls_line = (
+        f"Findings judge called:    {state.get('findings_judge_calls', 0)} time(s) total\n"
+        if not mute_findings else ""
+    )
+    anatomy_calls_line = (
+        f"Anatomy judge called:     {state.get('anatomy_judge_calls', 0)} time(s) total\n"
+        if not mute_anatomy else ""
+    )
+
+    feedback_sections = ""
+    if not mute_findings:
+        feedback_sections += f"Findings feedback:\n{findings_summary}\n\n"
+    if not mute_anatomy:
+        feedback_sections += f"Anatomy feedback:\n{anatomy_summary}\n\n"
+
+    return f"""=== SESSION HISTORY ===
+Current report version:   {current_version}
+{findings_calls_line}{anatomy_calls_line}Revisions completed:      {total_revisions}
+Candidates so far:        {candidate_stages}
+
+=== CURRENT VERSION STATUS ===
+Tool calls: {state["tool_call"]} / {max_tool_calls}  ({tool_calls_remaining} remaining)
+Revisions:  {total_revisions} / {max_revision_rounds}  ({revision_rounds_remaining} remaining)
+{judge_status_lines}
+
+{feedback_sections}=== CURRENT REPORT ===
+Source free-text:
+{free_text}
+
+Current structured report:
+{current_report}
+
+What is your next action?"""
+
+

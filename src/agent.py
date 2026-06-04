@@ -8,9 +8,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import httpx, os, argparse
 from openai import OpenAI
 import re as _re
+from argparse import ArgumentParser
 
 from prompts import *
 from backends import bnb_config, get_attn_impl, _strip_thinking
+import config
 
 
 hf_toekn = os.environ.get("HF_TOKEN", "")
@@ -301,9 +303,6 @@ def run_pipeline(free_text: str, is_agent:bool = True) -> str:
     return final_report_response
 
 
-import time
-import pandas as pd
-from argparse import ArgumentParser
 if __name__ == "__main__":
 
     args = ArgumentParser()
@@ -361,8 +360,8 @@ if __name__ == "__main__":
         os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
         client = OpenAI(
-            base_url="http://127.0.0.1:8050/v1",
-            api_key="EMPTY",
+            base_url=config.OPENAI_BASE_URL,
+            api_key=config.OPENAI_API_KEY,
             http_client=httpx.Client(trust_env=False, timeout=600),
         )
     else:
@@ -371,7 +370,7 @@ if __name__ == "__main__":
 
     gen_column = f"{args.model_name}-agent" if is_agent_mode else f"{args.model_name}-model"
     new_df = pd.DataFrame(columns=['StudyInstanceUid','ref',gen_column])
-    df = pd.read_csv("/home/hpc/iwi5/iwi5284h/RRG/srr_eval_all.csv")
+    df = pd.read_csv(config.INPUT_CSV)
     for idx,row in df.iterrows():
         start =  time.time()
         free_text = row['findings']
@@ -381,4 +380,4 @@ if __name__ == "__main__":
         end = time.time()
         print(f"Time taken for row {idx}: {end - start} seconds")
 
-    new_df.to_csv(f"/home/hpc/iwi5/iwi5284h/RRG/{gen_column}.csv",index=False)
+    new_df.to_csv(f"{config.OUTPUT_DIR}/{gen_column}.csv",index=False)
